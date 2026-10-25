@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Go ${{ matrix.go }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        go: ['1.23', stable]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go }}
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - run: go vet ./...
+      - name: Tests under the race detector
+        run: go test -race -count=1 ./...
+      - name: Only crypto/rand from the standard library's crypto
+        run: |
+          used=$(go list -f '{{join .Imports "\n"}}' ./... | grep '^crypto/' | sort -u)
+          echo "$used"
+          test "$used" = "crypto/rand"
+
+  interop:
+    name: OpenSSL and curl interop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - run: ./scripts/interop-openssl.sh
+
+  fuzz:
+    name: Fuzzing (30s per target)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: Fuzz
+        run: |
+          for target in FuzzParseClientHello FuzzParseServerHello FuzzParseHandshakeMessages FuzzParseCertificate FuzzClientHandshake; do
+            go test -run '^$' -fuzz "^$target\$" -fuzztime 30s .
+          done
+
+  internet:
+    name: Handshakes with real servers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - run: go build -o tlsget ./cmd/tlsget
+      - name: Fetch real sites
+        run: |
+          failed=0
+          for args in "https://www.google.com/" "https://github.com/" "https://en.wikipedia.org/" \
+                      "https://www.cloudflare.com/" "https://letsencrypt.org/" "https://www.microsoft.com/" \
+                      "-suite chacha20 https://www.cloudflare.com/" "-suite aes256 https://github.com/" \
+                      "-group p256 https://www.google.com/" "-group p384 https://www.microsoft.com/"; do
+            if ./tlsget -handshake-only $args >out.txt 2>&1 || ./tlsget -handshake-only $args >out.txt 2>&1; then
+              echo "ok    $args: $(grep -E 'cipher suite|key exchange' out.txt | awk '{print $NF}' | paste -sd' ' -)"
+            else
+              echo "FAIL  $args"; cat out.txt; failed=1
+            fi
+          done
+          exit $failed
